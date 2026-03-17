@@ -1,295 +1,254 @@
 import asyncio
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, date
 from typing import Optional
 from ..config import settings
 from ..cache import AppCache
 from .edgar_client import EdgarClient
-from .filing_parser import parse_form4_xml
+from .filing_parser import parse_form4_xml, TECH_SIC_CODES
 from .market_cap import bulk_prefetch, get_market_cap
 from .signal_detector import apply_signals
 
 logger = logging.getLogger(__name__)
 
-TECH_SIC_CODES = {"7370", "7371", "7372", "7374", "7379"}
-EFTS_BASE = "https://efts.sec.gov/EDGAR/search-index"
-DATA_BASE = "https://data.sec.gov"
 WWW_BASE = "https://www.sec.gov"
-PAGE_SIZE = 40
+DATA_BASE = "https://data.sec.gov"
+TICKERS_URL = f"{WWW_BASE}/files/company_tickers.json"
+
+# In-memory cache for discovered tech company CIKs
+_tech_cik_cache: dict[str, str] = {}   # cik (zero-padded 10-digit str) -> ticker
+_tech_cik_timestamp: Optional[datetime] = None
+TECH_CIK_TTL_HOURS = 24
 
 
-def _last_n_business_days(n: int) -> str:
-    """Return date string n business days ago."""
+def _last_n_business_days(n: int) -> date:
+    """Return the date n business days ago."""
     d = datetime.utcnow().date()
     count = 0
     while count < n:
         d -= timedelta(days=1)
-        if d.weekday() < 5:  # Mon-Fri
+        if d.weekday() < 5:   # Mon–Fri
             count += 1
-    return d.strftime("%Y-%m-%d")
+    return d
 
 
-async def _fetch_page(client: EdgarClient, params: dict) -> dict:
-    url = EFTS_BASE
-    resp = await client.get(url, params=params)
-    return resp.json()
+# ---------------------------------------------------------------------------
+# Tech company discovery via company_tickers.json + submissions SIC check
+# ---------------------------------------------------------------------------
 
-
-async def fetch_all_form4s(client: EdgarClient) -> list[dict]:
-    """Fetch all Form 4 filings from the last 30 days."""
-    start_date = _last_n_business_days(30)
-    today = datetime.utcnow().strftime("%Y-%m-%d")
-
-    base_params = {
-        "q": '""',
-        "dateRange": "custom",
-        "startdt": start_date,
-        "enddt": today,
-        "forms": "4",
-        "_source": "period_of_report,entity_name,file_num,period_of_report,biz_location,inc_states,category",
-        "hits.hits.total.value": "true",
-        "hits.hits._source.period_of_report": "true",
-    }
-
-    # First page
-    params = {**base_params, "from": 0, "size": PAGE_SIZE}
-    first = await _fetch_page(client, params)
-    hits = first.get("hits", {})
-    total = hits.get("total", {}).get("value", 0)
-    all_hits = hits.get("hits", [])
-
-    logger.info(f"Total Form 4 filings in range: {total}")
-
-    # Fetch remaining pages
-    remaining_pages = []
-    for offset in range(PAGE_SIZE, total, PAGE_SIZE):
-        remaining_pages.append({**base_params, "from": offset, "size": PAGE_SIZE})
-
-    if remaining_pages:
-        page_results = await asyncio.gather(
-            *[_fetch_page(client, p) for p in remaining_pages],
-            return_exceptions=True,
-        )
-        for result in page_results:
-            if isinstance(result, dict):
-                all_hits.extend(result.get("hits", {}).get("hits", []))
-
-    return all_hits
-
-
-def _extract_sic(hit: dict) -> str:
-    source = hit.get("_source", {})
-    # SIC code may be in category or other fields
-    category = source.get("category", "")
-    # Try to get SIC from the hit
-    sic = source.get("period_of_report", "")
-    return source.get("biz_location", "")
-
-
-async def fetch_filing_xml(client: EdgarClient, hit: dict) -> Optional[tuple]:
-    """Fetch Form 4 XML. Returns (accession_number, xml_bytes, filing_url) or None."""
+async def _fetch_submissions(client: EdgarClient, cik_padded: str) -> Optional[dict]:
+    """Fetch data.sec.gov/submissions/CIK{cik}.json for one company."""
+    url = f"{DATA_BASE}/submissions/CIK{cik_padded}.json"
     try:
-        source = hit.get("_source", {})
-        entity_id = hit.get("_id", "")
-
-        # The _id is typically "accession_number"
-        # Build filing index URL
-        # EDGAR filing format: /Archives/edgar/data/{CIK}/{accession_no_dashes}/
-        file_num = source.get("file_num", "")
-
-        # Try to get accession number from _id
-        accession = entity_id
-        if not accession:
-            return None
-
-        # Normalize accession number
-        acc_normalized = accession.replace("-", "")
-        if len(acc_normalized) != 18:
-            return None
-
-        # CIK is first 10 digits of accession
-        cik = acc_normalized[:10].lstrip("0")
-        acc_dashed = f"{acc_normalized[:10]}-{acc_normalized[10:12]}-{acc_normalized[12:]}"
-
-        filing_index_url = f"{WWW_BASE}/Archives/edgar/data/{cik}/{acc_normalized}/{acc_dashed}-index.htm"
-        xml_url = f"{WWW_BASE}/Archives/edgar/data/{cik}/{acc_normalized}/{acc_dashed}.xml"
-
-        # Try primary document URL
-        try:
-            resp = await client.get(xml_url)
-            return (acc_dashed, resp.content, f"{WWW_BASE}/Archives/edgar/data/{cik}/{acc_normalized}/")
-        except Exception:
-            pass
-
-        # Fallback: try fetching filing index to find XML
-        try:
-            idx_resp = await client.get(
-                f"{DATA_BASE}/submissions/CIK{cik.zfill(10)}.json"
-            )
-            # Not ideal, skip for now
-        except Exception:
-            pass
-
-        return None
-    except Exception as e:
-        logger.debug(f"Failed to fetch filing XML: {e}")
+        resp = await client.get(url)
+        return resp.json()
+    except Exception:
         return None
 
+
+async def _build_tech_cik_map(client: EdgarClient) -> dict[str, str]:
+    """
+    Download company_tickers.json, then check each company's submissions for
+    a tech SIC code.  Returns {cik_10digit -> ticker}.
+
+    Cold-start note: ~10 k companies at 8 rps ≈ 20 min. Result is cached for
+    TECH_CIK_TTL_HOURS so subsequent pipeline runs are fast.
+    """
+    logger.info("Building tech-company CIK map from company_tickers.json …")
+    resp = await client.get(TICKERS_URL)
+    entries = list(resp.json().values())   # [{cik_str, ticker, title}, …]
+    logger.info(f"company_tickers.json: {len(entries)} companies to scan")
+
+    result: dict[str, str] = {}
+
+    async def check(entry: dict):
+        cik = str(entry["cik_str"]).zfill(10)
+        ticker = entry.get("ticker", "")
+        data = await _fetch_submissions(client, cik)
+        if data and str(data.get("sic", "")) in TECH_SIC_CODES:
+            return (cik, ticker)
+        return None
+
+    results = await asyncio.gather(*[check(e) for e in entries], return_exceptions=True)
+    for r in results:
+        if isinstance(r, tuple):
+            result[r[0]] = r[1]
+
+    logger.info(f"Discovered {len(result)} tech companies (SIC codes: {TECH_SIC_CODES})")
+    return result
+
+
+async def get_tech_ciks(client: EdgarClient) -> dict[str, str]:
+    """Return cached {cik -> ticker} for tech companies, refreshed every 24 h."""
+    global _tech_cik_cache, _tech_cik_timestamp
+    if _tech_cik_cache and _tech_cik_timestamp:
+        if datetime.utcnow() - _tech_cik_timestamp < timedelta(hours=TECH_CIK_TTL_HOURS):
+            return _tech_cik_cache
+    _tech_cik_cache = await _build_tech_cik_map(client)
+    _tech_cik_timestamp = datetime.utcnow()
+    return _tech_cik_cache
+
+
+# ---------------------------------------------------------------------------
+# Per-company Form 4 fetching
+# ---------------------------------------------------------------------------
+
+def _recent_form4_entries(submissions: dict, cutoff: date) -> list[tuple[str, str]]:
+    """
+    From a submissions JSON, return (accession_dashed, primary_document) pairs
+    for Form 4 / 4-A filings on or after *cutoff*.
+    """
+    recent = submissions.get("filings", {}).get("recent", {})
+    forms       = recent.get("form", [])
+    accessions  = recent.get("accessionNumber", [])
+    dates       = recent.get("filingDate", [])
+    primary_docs = recent.get("primaryDocument", [])
+
+    entries = []
+    for form, acc, date_str, doc in zip(forms, accessions, dates, primary_docs):
+        if form not in ("4", "4/A"):
+            continue
+        try:
+            if datetime.strptime(date_str, "%Y-%m-%d").date() < cutoff:
+                continue
+        except ValueError:
+            continue
+        entries.append((acc, doc))
+    return entries
+
+
+async def _fetch_form4_xml(
+    client: EdgarClient,
+    cik: str,
+    acc_dashed: str,
+    primary_doc: str,
+) -> Optional[bytes]:
+    """
+    Fetch Form 4 XML bytes from www.sec.gov/Archives.
+    Tries the primaryDocument name first; falls back to the accession-number.xml
+    convention used by many Form 4 filers.
+    """
+    cik_plain   = cik.lstrip("0")
+    acc_nodash  = acc_dashed.replace("-", "")
+    base_path   = f"{WWW_BASE}/Archives/edgar/data/{cik_plain}/{acc_nodash}"
+
+    for filename in (primary_doc, f"{acc_dashed}.xml"):
+        if not filename:
+            continue
+        try:
+            resp = await client.get(f"{base_path}/{filename}")
+            return resp.content
+        except Exception:
+            continue
+    return None
+
+
+async def _process_company(
+    client: EdgarClient,
+    cik: str,
+    cutoff: date,
+    seen: set,
+) -> list:
+    """
+    Fetch submissions for one tech company, find recent Form 4s, parse XMLs.
+    Returns a (possibly empty) list of FilingRecord objects.
+    """
+    submissions = await _fetch_submissions(client, cik)
+    if not submissions:
+        return []
+
+    records = []
+    for acc_dashed, primary_doc in _recent_form4_entries(submissions, cutoff):
+        acc_nodash = acc_dashed.replace("-", "")
+        if acc_nodash in seen:
+            continue
+
+        cik_plain   = cik.lstrip("0")
+        filing_url  = f"{WWW_BASE}/Archives/edgar/data/{cik_plain}/{acc_nodash}/"
+
+        xml_bytes = await _fetch_form4_xml(client, cik, acc_dashed, primary_doc)
+        if not xml_bytes:
+            logger.debug(f"No XML for {acc_dashed}")
+            continue
+
+        parsed = parse_form4_xml(xml_bytes, acc_dashed, filing_url)
+        if parsed:
+            seen.add(acc_nodash)
+            records.extend(parsed)
+
+    return records
+
+
+# ---------------------------------------------------------------------------
+# Deduplication
+# ---------------------------------------------------------------------------
+
+def _dedup_filings(filings):
+    """Keep one record per (issuerCik, insiderCik, transactionDate), preferring amendments."""
+    seen: dict = {}
+    for f in filings:
+        key = (f.issuerCik, f.insiderCik, f.transactionDate)
+        if key not in seen or "/A" in f.id:
+            seen[key] = f
+    return list(seen.values())
+
+
+# ---------------------------------------------------------------------------
+# Main pipeline
+# ---------------------------------------------------------------------------
 
 async def run_pipeline(cache: AppCache, client: EdgarClient):
-    """Main pipeline: fetch -> filter -> parse -> signal -> cache."""
+    """fetch → filter → parse → signal → cache."""
     logger.info("Pipeline started")
     try:
-        # 1. Fetch all Form 4s
-        all_hits = await fetch_all_form4s(client)
-        logger.info(f"Fetched {len(all_hits)} Form 4 hits")
+        cutoff = _last_n_business_days(30)
 
-        # 2. Use EDGAR full-text search with SIC filter via submissions API
-        # We'll fetch XMLs and filter by SIC from the parsed data
-        # Actually, use data.sec.gov company search for tech companies
-        # Better approach: fetch recent Form 4s for tech SIC codes directly
+        # 1. Resolve tech company CIKs (cached after first run)
+        tech_ciks = await get_tech_ciks(client)
+        logger.info(f"Processing {len(tech_ciks)} tech companies for Form 4s since {cutoff}")
 
-        filings_raw = await _fetch_tech_form4s(client)
-        logger.info(f"After SIC filter: {len(filings_raw)} filings")
+        # 2. Fetch submissions + XMLs for every tech company concurrently
+        seen_accessions: set = set()
+        tasks = [
+            _process_company(client, cik, cutoff, seen_accessions)
+            for cik in tech_ciks
+        ]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
 
-        # 3. Filter: only "P" transactions, not 10b5-1
-        filings = [f for f in filings_raw if not f.is10b51 and f.transactionType == "P"]
+        filings_raw = []
+        for r in results:
+            if isinstance(r, list):
+                filings_raw.extend(r)
+        logger.info(f"Fetched {len(filings_raw)} raw Form 4 records")
+
+        # 3. Keep only open-market purchases (code "P"), no 10b5-1 plans
+        filings = [f for f in filings_raw if f.transactionType == "P" and not f.is10b51]
         logger.info(f"After transaction filter: {len(filings)} filings")
 
-        # 4. Bulk fetch market caps
+        # 4. Deduplicate (prefer amendments over originals)
+        filings = _dedup_filings(filings)
+        logger.info(f"After dedup: {len(filings)} filings")
+
+        # 5. Market-cap filter
         tickers = [f.ticker for f in filings if f.ticker]
         await bulk_prefetch(tickers, settings.market_cap_ttl_seconds)
 
-        # Attach market caps and filter
         filtered = []
         for f in filings:
             cap = await get_market_cap(f.ticker, settings.market_cap_ttl_seconds) if f.ticker else None
             updated = f.model_copy(update={"marketCap": cap})
             if cap is None or cap <= settings.max_market_cap_usd:
                 filtered.append(updated)
+        logger.info(f"After market-cap filter: {len(filtered)} filings")
 
-        logger.info(f"After market cap filter: {len(filtered)} filings")
-
-        # 5. Detect signals
+        # 6. Signal detection
         with_signals = await apply_signals(filtered, client)
         logger.info(f"Pipeline complete: {len(with_signals)} filings with signals")
 
-        # 6. Update cache
+        # 7. Publish to cache
         cache.update(with_signals)
 
     except Exception as e:
         logger.error(f"Pipeline error: {e}", exc_info=True)
     finally:
         await cache.release_refresh()
-
-
-async def _fetch_tech_form4s(client: EdgarClient):
-    """Fetch Form 4 filings for tech SIC codes using EDGAR company search."""
-    from .filing_parser import parse_form4_xml, TECH_SIC_CODES
-    import asyncio
-
-    all_filings = []
-    seen_accessions: set[str] = set()
-
-    for sic in TECH_SIC_CODES:
-        try:
-            # Search for companies with this SIC code that filed Form 4 recently
-            url = f"{DATA_BASE}/submissions/index.json"
-            # Use EDGAR full-text search
-            start_date = _last_n_business_days(30)
-            today = datetime.utcnow().strftime("%Y-%m-%d")
-
-            search_url = "https://efts.sec.gov/EDGAR/search-index"
-            params = {
-                "q": f'"{sic}"',
-                "dateRange": "custom",
-                "startdt": start_date,
-                "enddt": today,
-                "forms": "4",
-                "from": 0,
-                "size": 40,
-            }
-            try:
-                resp = await client.get(search_url, params=params)
-                data = resp.json()
-            except Exception:
-                continue
-
-            hits = data.get("hits", {}).get("hits", [])
-
-            # Process hits in batches to stay under rate limit
-            batch_size = 10
-            for i in range(0, len(hits), batch_size):
-                batch = hits[i:i + batch_size]
-                results = await asyncio.gather(
-                    *[_process_hit(client, hit, seen_accessions, sic) for hit in batch],
-                    return_exceptions=True,
-                )
-                for result in results:
-                    if isinstance(result, list):
-                        all_filings.extend(result)
-
-        except Exception as e:
-            logger.warning(f"SIC {sic} fetch error: {e}")
-
-    # Deduplicate amended filings: prefer amendment
-    return _dedup_filings(all_filings)
-
-
-async def _process_hit(client: EdgarClient, hit: dict, seen: set, sic: str):
-    """Process a single search hit into filing records."""
-    from .filing_parser import parse_form4_xml
-
-    try:
-        entity_id = hit.get("_id", "")
-        if not entity_id:
-            return []
-
-        acc_normalized = entity_id.replace("-", "")
-        if len(acc_normalized) != 18:
-            return []
-
-        if acc_normalized in seen:
-            return []
-
-        cik = acc_normalized[:10].lstrip("0")
-        acc_dashed = f"{acc_normalized[:10]}-{acc_normalized[10:12]}-{acc_normalized[12:]}"
-
-        # Try primary form4 XML URL pattern
-        xml_url = f"{WWW_BASE}/Archives/edgar/data/{cik}/{acc_normalized}/{acc_dashed}.xml"
-        filing_url = f"{WWW_BASE}/Archives/edgar/data/{cik}/{acc_normalized}/"
-
-        try:
-            resp = await client.get(xml_url)
-            xml_bytes = resp.content
-        except Exception:
-            # Try alternative: fetch filing index
-            try:
-                idx_url = f"{DATA_BASE}/submissions/CIK{cik.zfill(10)}.json"
-                # Skip for now, too many requests
-                return []
-            except Exception:
-                return []
-
-        records = parse_form4_xml(xml_bytes, acc_dashed, filing_url)
-        if records:
-            seen.add(acc_normalized)
-        return records
-
-    except Exception as e:
-        logger.debug(f"Hit processing error: {e}")
-        return []
-
-
-def _dedup_filings(filings):
-    """Deduplicate by issuer CIK + insider CIK + transaction date, preferring amendments."""
-    seen = {}
-    for f in filings:
-        key = (f.issuerCik, f.insiderCik, f.transactionDate)
-        if key not in seen:
-            seen[key] = f
-        else:
-            # Prefer amendment (4/A) over original
-            if "/A" in f.id:
-                seen[key] = f
-    return list(seen.values())

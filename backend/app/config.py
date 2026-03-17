@@ -4,7 +4,7 @@ import json
 
 
 class Settings(BaseSettings):
-    edgar_user_agent: str = "EDGAR Insider Alpha contact@example.com"
+    edgar_user_agent: str = "Daniel Liu daniel@dartmouth.edu"
     cache_ttl_seconds: int = 3600
     market_cap_ttl_seconds: int = 86400
     max_market_cap_usd: float = 2_000_000_000
