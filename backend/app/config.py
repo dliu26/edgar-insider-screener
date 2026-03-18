@@ -7,7 +7,7 @@ class Settings(BaseSettings):
     edgar_user_agent: str = "Daniel Liu daniel@dartmouth.edu"
     cache_ttl_seconds: int = 3600
     market_cap_ttl_seconds: int = 86400
-    max_market_cap_usd: float = 2_000_000_000
+    max_market_cap_usd: float = 50_000_000_000
     cors_origins: list[str] = ["http://localhost:3000"]
     port: int = 8000
 

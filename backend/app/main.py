@@ -10,6 +10,7 @@ from .services.pipeline import run_pipeline
 from .routers import filings, signals, refresh
 
 logging.basicConfig(level=logging.INFO)
+logging.getLogger("app.services.filing_parser").setLevel(logging.DEBUG)
 logger = logging.getLogger(__name__)
 
 
