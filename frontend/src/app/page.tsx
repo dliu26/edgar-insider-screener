@@ -1,8 +1,7 @@
 "use client";
-import { useState, useCallback } from "react";
-import type { FilingRecord, Filters, SortConfig } from "@/types";
+import { useState, useCallback, useMemo } from "react";
+import type { FilingRecord, Filters, SignalSummary, SortConfig } from "@/types";
 import { useFilings } from "@/hooks/useFilings";
-import { useSignalSummary } from "@/hooks/useSignalSummary";
 import { SummaryBar } from "@/components/dashboard/SummaryBar";
 import { FilterBar } from "@/components/dashboard/FilterBar";
 import { FilingsTable } from "@/components/dashboard/FilingsTable";
@@ -20,7 +19,21 @@ export default function Dashboard() {
   const [selected, setSelected] = useState<FilingRecord | null>(null);
 
   const { data, isLoading, mutate } = useFilings(filters, sort);
-  const { data: summary, mutate: mutateSum } = useSignalSummary();
+
+  const summary = useMemo<SignalSummary | undefined>(() => {
+    const filings = data?.filings;
+    if (!filings) return undefined;
+    return {
+      totalSignals: filings.filter((f) => f.signals.length > 0).length,
+      clusterBuys: filings.filter((f) => f.signals.includes("CLUSTER_BUY")).length,
+      firstEverBuys: filings.filter((f) => f.signals.includes("FIRST_EVER_BUY")).length,
+      highConviction: filings.filter((f) => f.signals.includes("HIGH_CONVICTION")).length,
+      largestTransaction: filings.reduce<FilingRecord | null>(
+        (max, f) => (max === null || f.totalValue > max.totalValue ? f : max),
+        null
+      ),
+    };
+  }, [data?.filings]);
 
   const handleSort = useCallback(
     (field: string) => {
@@ -35,8 +48,7 @@ export default function Dashboard() {
 
   const handleRefreshed = useCallback(() => {
     mutate();
-    mutateSum();
-  }, [mutate, mutateSum]);
+  }, [mutate]);
 
   return (
     <div className="min-h-screen bg-surface-900">
