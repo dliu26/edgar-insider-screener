@@ -5,6 +5,7 @@ import json
 
 class Settings(BaseSettings):
     edgar_user_agent: str = "Daniel Liu daniel@dartmouth.edu"
+    polygon_api_key: str = ""
     cache_ttl_seconds: int = 3600
     market_cap_ttl_seconds: int = 86400
     max_market_cap_usd: float = 50_000_000_000

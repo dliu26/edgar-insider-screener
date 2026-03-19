@@ -1,13 +1,12 @@
 """
 Market data fetching: market cap and ADTV.
 
-Fallback chain for market cap:
-  1. yfinance fast_info.market_cap
-  2. yfinance info['marketCap']
-  3. Yahoo Finance chart API (price) × SEC EDGAR company facts (shares outstanding)
+Primary source: Polygon.io API
+  - Market cap: /v3/reference/tickers/{ticker} → results.market_cap
+  - ADTV:       /v2/aggs/ticker/{ticker}/prev  → results[0].v
 
-ADTV is computed from the 3-month Yahoo Finance chart volume data,
-with yfinance fast_info as a secondary option.
+Fallback for market cap (if Polygon fails or key missing):
+  Yahoo Finance chart API (price) × SEC EDGAR company facts (shares outstanding)
 """
 import asyncio
 import logging
@@ -19,8 +18,8 @@ import httpx
 
 logger = logging.getLogger(__name__)
 
-_YAHOO_HEADERS = {"User-Agent": "Mozilla/5.0"}
-_SEC_HEADERS   = {"User-Agent": "Daniel Liu daniel@dartmouth.edu"}
+_SEC_HEADERS = {"User-Agent": "Daniel Liu daniel@dartmouth.edu"}
+_POLYGON_BASE = "https://api.polygon.io"
 
 
 class MarketData(NamedTuple):
@@ -32,6 +31,11 @@ class MarketData(NamedTuple):
 _cache: dict[str, tuple[MarketData, datetime]] = {}
 _pending: dict[str, asyncio.Future] = {}
 _lock = asyncio.Lock()
+
+
+def _api_key() -> str:
+    from ..config import settings
+    return settings.polygon_api_key
 
 
 async def get_market_data(
@@ -78,68 +82,90 @@ async def _fetch(ticker: str, cik: str, fut: asyncio.Future):
 
 
 def _fetch_sync(ticker: str, cik: str) -> MarketData:
+    api_key = _api_key()
     cap: Optional[float] = None
     adtv: Optional[float] = None
 
-    # ── Stage 1: yfinance fast_info ───────────────────────────────────────
-    try:
-        import yfinance as yf
-        t = yf.Ticker(ticker)
-        fi = t.fast_info
-        cap_raw  = getattr(fi, "market_cap", None)
-        adtv_raw = getattr(fi, "three_month_average_volume", None)
-        if cap_raw:
-            cap = float(cap_raw)
-            logger.debug(f"[{ticker}] market_cap from yfinance fast_info: ${cap/1e9:.2f}B")
-        if adtv_raw:
-            adtv = float(adtv_raw)
-    except Exception as exc:
-        logger.debug(f"[{ticker}] yfinance fast_info failed: {exc}")
+    # ── Stage 1: Polygon.io ───────────────────────────────────────────────
+    if api_key:
+        cap, adtv = _polygon_fetch(ticker, api_key)
+    else:
+        logger.warning(f"[{ticker}] POLYGON_API_KEY not set, skipping Polygon")
 
-    # ── Stage 2: yfinance info dict ───────────────────────────────────────
-    if not cap:
-        try:
-            import yfinance as yf
-            info = yf.Ticker(ticker).info
-            cap_raw = info.get("marketCap") or info.get("market_cap")
-            if cap_raw:
-                cap = float(cap_raw)
-                logger.debug(f"[{ticker}] market_cap from yfinance info: ${cap/1e9:.2f}B")
-            if not adtv:
-                adtv_raw = info.get("averageVolume") or info.get("averageDailyVolume10Day")
-                if adtv_raw:
-                    adtv = float(adtv_raw)
-        except Exception as exc:
-            logger.debug(f"[{ticker}] yfinance info failed: {exc}")
-
-    # ── Stage 3: Yahoo chart API + SEC EDGAR company facts ────────────────
-    # Always fetch price/ADTV from Yahoo chart (reliable even when yfinance breaks)
-    price, chart_adtv = _yahoo_chart(ticker)
-    if chart_adtv and not adtv:
-        adtv = chart_adtv
-
-    if not cap and price:
-        shares = _sec_shares(cik) if cik else None
-        if shares:
-            cap = float(shares) * price
-            logger.debug(
-                f"[{ticker}] market_cap from SEC shares × Yahoo price: "
-                f"{shares:,} × ${price:.2f} = ${cap/1e9:.2f}B"
-            )
+    # ── Stage 2: Yahoo chart price × SEC shares outstanding ───────────────
+    if cap is None:
+        logger.debug(f"[{ticker}] Polygon market cap unavailable, trying SEC+Yahoo fallback")
+        price, yahoo_adtv = _yahoo_chart(ticker)
+        if yahoo_adtv and adtv is None:
+            adtv = yahoo_adtv
+        if price:
+            shares = _sec_shares(cik) if cik else None
+            if shares:
+                cap = float(shares) * price
+                logger.info(
+                    f"[{ticker}] market_cap fallback: {shares:,} shares × ${price:.2f} = ${cap/1e9:.2f}B"
+                )
+            else:
+                logger.warning(f"[{ticker}] fallback failed: no shares outstanding (cik={cik!r})")
         else:
-            logger.warning(f"[{ticker}] could not determine shares outstanding (cik={cik!r})")
+            logger.warning(f"[{ticker}] fallback failed: could not fetch price from Yahoo")
 
     if cap is None:
-        logger.warning(f"[{ticker}] all market cap strategies failed")
+        logger.warning(f"[{ticker}] all market cap strategies exhausted — returning None")
 
     return MarketData(market_cap=cap, adtv=adtv)
 
 
+def _polygon_fetch(ticker: str, api_key: str) -> tuple[Optional[float], Optional[float]]:
+    """Fetch market cap and previous-day volume from Polygon.io."""
+    cap: Optional[float] = None
+    adtv: Optional[float] = None
+
+    with httpx.Client(timeout=15) as client:
+        # Market cap from ticker reference
+        try:
+            r = client.get(
+                f"{_POLYGON_BASE}/v3/reference/tickers/{ticker}",
+                params={"apiKey": api_key},
+            )
+            if r.status_code == 200:
+                mc = r.json().get("results", {}).get("market_cap")
+                if mc:
+                    cap = float(mc)
+                    logger.debug(f"[{ticker}] Polygon market_cap: ${cap/1e9:.2f}B")
+                else:
+                    logger.debug(f"[{ticker}] Polygon ticker reference: market_cap field empty")
+            else:
+                logger.debug(f"[{ticker}] Polygon reference HTTP {r.status_code}: {r.text[:120]}")
+        except Exception as exc:
+            logger.debug(f"[{ticker}] Polygon reference error: {exc}")
+
+        # Previous-day volume for ADTV
+        try:
+            r2 = client.get(
+                f"{_POLYGON_BASE}/v2/aggs/ticker/{ticker}/prev",
+                params={"apiKey": api_key},
+            )
+            if r2.status_code == 200:
+                results = r2.json().get("results", [])
+                if results:
+                    v = results[0].get("v")
+                    if v:
+                        adtv = float(v)
+                        logger.debug(f"[{ticker}] Polygon prev volume: {adtv:,.0f}")
+            else:
+                logger.debug(f"[{ticker}] Polygon prev aggs HTTP {r2.status_code}")
+        except Exception as exc:
+            logger.debug(f"[{ticker}] Polygon prev aggs error: {exc}")
+
+    return cap, adtv
+
+
 def _yahoo_chart(ticker: str) -> tuple[Optional[float], Optional[float]]:
-    """Fetch price and 3-month ADTV from Yahoo Finance chart API."""
+    """Fetch price and 3-month ADTV from Yahoo Finance chart API (no auth needed)."""
     url = f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}?interval=1d&range=3mo"
     try:
-        with httpx.Client(headers=_YAHOO_HEADERS, follow_redirects=True, timeout=15) as client:
+        with httpx.Client(headers={"User-Agent": "Mozilla/5.0"}, follow_redirects=True, timeout=15) as client:
             r = client.get(url)
         if r.status_code != 200:
             logger.debug(f"[{ticker}] Yahoo chart HTTP {r.status_code}")
@@ -152,11 +178,9 @@ def _yahoo_chart(ticker: str) -> tuple[Optional[float], Optional[float]]:
         volumes = result[0].get("indicators", {}).get("quote", [{}])[0].get("volume", [])
         vols    = [v for v in volumes if v is not None and v > 0]
         adtv    = sum(vols) / len(vols) if vols else None
-        logger.debug(f"[{ticker}] Yahoo chart: price=${price}, ADTV={adtv:,.0f}" if adtv else
-                     f"[{ticker}] Yahoo chart: price=${price}, no volume data")
         return float(price) if price else None, adtv
     except Exception as exc:
-        logger.debug(f"[{ticker}] Yahoo chart failed: {exc}")
+        logger.debug(f"[{ticker}] Yahoo chart error: {exc}")
         return None, None
 
 
@@ -168,35 +192,30 @@ def _sec_shares(cik: str) -> Optional[int]:
         with httpx.Client(headers=_SEC_HEADERS, follow_redirects=True, timeout=20) as client:
             r = client.get(url)
         if r.status_code != 200:
-            logger.debug(f"SEC company facts HTTP {r.status_code} for CIK {cik_padded}")
+            logger.debug(f"[SEC] company facts HTTP {r.status_code} for CIK {cik_padded}")
             return None
         gaap = r.json().get("facts", {}).get("us-gaap", {})
         key = "CommonStockSharesOutstanding"
         if key not in gaap:
             return None
         entries = gaap[key].get("units", {}).get("shares", [])
-        candidates = [
-            e for e in entries
-            if e.get("form") in ("10-K", "10-Q", "10-K/A", "10-Q/A")
-        ]
+        candidates = [e for e in entries if e.get("form") in ("10-K", "10-Q", "10-K/A", "10-Q/A")]
         if not candidates:
             candidates = entries
         if not candidates:
             return None
         return int(sorted(candidates, key=lambda x: x.get("end", ""))[-1]["val"])
     except Exception as exc:
-        logger.debug(f"SEC company facts failed for CIK {cik_padded}: {exc}")
+        logger.debug(f"[SEC] company facts error for CIK {cik_padded}: {exc}")
         return None
 
 
 async def get_market_cap(ticker: str, ttl_seconds: int = 86400) -> Optional[float]:
-    """Convenience wrapper — returns just the market cap."""
     data = await get_market_data(ticker, ttl_seconds=ttl_seconds)
     return data.market_cap
 
 
 async def bulk_prefetch(tickers: list[str], ttl_seconds: int = 86400):
-    """Pre-warm cache for all tickers concurrently."""
     unique = list({t.upper().strip() for t in tickers if t and t.strip()})
     await asyncio.gather(
         *[get_market_data(t, ttl_seconds=ttl_seconds) for t in unique],
