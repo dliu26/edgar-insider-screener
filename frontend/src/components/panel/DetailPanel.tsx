@@ -7,6 +7,7 @@ import { SignalBadge } from "@/components/dashboard/SignalBadge";
 import { TransactionChart } from "./TransactionChart";
 import {
   formatCurrency,
+  formatPrice,
   formatShares,
   formatDate,
   formatMarketCap,
@@ -84,7 +85,7 @@ export function DetailPanel({ filing, onClose }: Props) {
               {[
                 { label: "Total Value", value: formatCurrency(filing.totalValue) },
                 { label: "Shares Bought", value: formatShares(filing.shares) },
-                { label: "Price / Share", value: formatCurrency(filing.pricePerShare) },
+                { label: "Price / Share", value: formatPrice(filing.pricePerShare) },
                 { label: "Market Cap", value: formatMarketCap(filing.marketCap) },
                 { label: "Transaction Date", value: formatDate(filing.transactionDate) },
                 { label: "Post-Txn Shares", value: formatShares(filing.postTransactionShares) },

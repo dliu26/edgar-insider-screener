@@ -562,13 +562,18 @@ async def run_pipeline(cache: AppCache, client: EdgarClient):
         logger.info(f"After dedup: {len(filings)} filings")
 
         # Market data enrichment (market cap + ADTV) + sector + filter
+        # bulk_prefetch just warms the cache; per-filing fetch below passes CIK too
         tickers = [f.ticker for f in filings if f.ticker]
         await bulk_prefetch(tickers, settings.market_cap_ttl_seconds)
 
         filtered: list = []
         for f in filings:
             if f.ticker:
-                md = await get_market_data(f.ticker, settings.market_cap_ttl_seconds)
+                md = await get_market_data(
+                    f.ticker,
+                    cik=f.issuerCik,
+                    ttl_seconds=settings.market_cap_ttl_seconds,
+                )
                 cap  = md.market_cap
                 adtv = md.adtv
             else:
