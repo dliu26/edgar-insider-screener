@@ -6,6 +6,18 @@ export function formatCurrency(value: number | null | undefined): string {
   return `$${value.toFixed(0)}`;
 }
 
+export function formatPrice(value: number | null | undefined): string {
+  if (value == null) return "—";
+  return `$${value.toFixed(2)}`;
+}
+
+export function formatAdtv(vol: number | null | undefined): string {
+  if (vol == null) return "N/A";
+  if (vol >= 1_000_000) return `${(vol / 1_000_000).toFixed(1)}M`;
+  if (vol >= 1_000) return `${(vol / 1_000).toFixed(0)}K`;
+  return vol.toLocaleString();
+}
+
 export function formatShares(shares: number): string {
   if (shares >= 1_000_000) return `${(shares / 1_000_000).toFixed(2)}M`;
   if (shares >= 1_000) return `${(shares / 1_000).toFixed(0)}K`;

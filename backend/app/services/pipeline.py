@@ -8,9 +8,10 @@ from lxml import etree
 
 from ..config import settings
 from ..cache import AppCache
+from ..models.schemas import Sc13dRecord
 from .edgar_client import EdgarClient
 from .filing_parser import parse_form4_xml
-from .market_cap import bulk_prefetch, get_market_cap
+from .market_cap import bulk_prefetch, get_market_data
 from .signal_detector import apply_signals
 
 logger = logging.getLogger(__name__)
@@ -101,6 +102,46 @@ WATCHLIST_TICKERS: frozenset[str] = frozenset({
     "FARO", "INOD", "MITK", "MTCH", "NRDS", "RDDT", "SDGR", "SNAP",
     "UDMY", "UPWK", "YELP",
 })
+
+# Static sector mapping derived from watchlist groupings
+TICKER_SECTOR: dict[str, str] = {
+    **{t: "Software/SaaS" for t in [
+        "ALKT","ASAN","BILL","BRZE","CFLT","DDOG","DOCN","GTLB","JAMF","KRTX",
+        "MGNI","MQ","PCTY","PUBM","SEMR","SMAR","SPSC","TASK","VERX","ZI",
+        "AMPL","APPF","APPN","APPS","BAND","BIGC","BLKB","BL","BOX","CDAY",
+        "CLBT","CWAN","DCBO","DBX","DOMO","DOCU","DV","EGHT","ENFN","ESTC",
+        "EVER","EVBG","FIVN","FOUR","FRSH","FROG","FSLY","GDYN","GLBE","GWRE",
+        "HCAT","HLIT","HUBS","INFA","INST","INTA","LPSN","LSPD","MAPS","MNDY",
+        "MNTV","NABL","NCNO","NTNX","OMCL","PAR","PCOR","PEGA","PHR","PRFT",
+        "PRGS","PYCR","QTWO","RAMP","RNG","RMNI","SNCR","SPNS","SPT","SQSP",
+        "SUMO","TOST","TRMR","TTGT","TWLO","TWOU","UPLD","WEAV","WIX","XMTR",
+        "YEXT","ZETA","ZUO",
+    ]},
+    **{t: "Cybersecurity" for t in [
+        "AXON","CGNT","CRWD","CYBR","OKTA","OSPN","QLYS","RBRK","RDWR","RPD",
+        "S","SCWX","TENB","VRNS",
+    ]},
+    **{t: "Fintech/Payments" for t in [
+        "AFRM","ALIT","AVDX","BLND","CDLX","COIN","DAVE","DKNG","ENVA","EVTC",
+        "EXFY","FLYW","GDRX","HIMS","HOOD","LMND","NVEI","OPEN","PAYO","PAYC",
+        "PSFE","RPAY","RSKD","SOFI","UPST","WEX",
+    ]},
+    **{t: "Data/AI/Analytics" for t in [
+        "AI","ALTR","BBAI","DOCS","GENI","IONQ","PLTR","SOUN","VERI","VNET",
+    ]},
+    **{t: "Infrastructure/Hardware" for t in [
+        "ACMR","CEVA","COHU","FFIV","FORM","NTAP","PSTG","SMCI","SSYS","VIAV",
+    ]},
+    **{t: "IT Services" for t in [
+        "CACI","CNXC","CVLT","DAVA","DFIN","EPAM","EXLS","EXPI","FORR","HCKT",
+        "IBEX","ITRI","KFRC","SAIC","TTEC",
+    ]},
+    **{t: "Vertical SaaS" for t in [
+        "AGYS","ALLT","ALRM","ANGI","API","AVNW","BFLY","CARS","CCSI","CHGG",
+        "COMP","COUR","CRNC","CRTO","DUOL","EVRI","FARO","INOD","MITK","MTCH",
+        "NRDS","RDDT","SDGR","SNAP","UDMY","UPWK","YELP",
+    ]},
+}
 
 
 # ---------------------------------------------------------------------------
@@ -375,6 +416,118 @@ def _dedup_filings(filings: list) -> list:
 
 
 # ---------------------------------------------------------------------------
+# Schedule 13D pipeline
+# ---------------------------------------------------------------------------
+
+# Regex to extract a ticker-like symbol from the company name in 13D entries
+_TICKER_RE = re.compile(r'\(([A-Z]{1,5})\)')
+
+
+async def run_sc13d_pipeline(
+    client: EdgarClient,
+    cik_to_ticker: dict[str, str],
+    cutoff: date,
+) -> list[Sc13dRecord]:
+    """
+    Fetch recent SC 13D filings from the EDGAR general Atom feed,
+    filter to watchlist companies, return Sc13dRecord list.
+    """
+    url = (
+        f"{WWW_BASE}/cgi-bin/browse-edgar"
+        "?action=getcurrent&type=SC+13D&dateb=&owner=include"
+        "&count=100&search_text=&output=atom"
+    )
+    try:
+        resp = await client.get(url)
+        root = etree.fromstring(resp.content)
+    except Exception as exc:
+        logger.warning(f"SC 13D feed fetch failed: {exc}")
+        return []
+
+    # Build reverse map: issuer name fragment → ticker (for fallback matching)
+    ticker_to_cik = {v: k for k, v in cik_to_ticker.items()}
+
+    records: list[Sc13dRecord] = []
+    seen: set[str] = set()
+
+    for entry in root.findall(f"{_E}entry"):
+        # Form type filter
+        cat_el = entry.find(f"{_E}category")
+        if cat_el is not None:
+            term = cat_el.get("term", "").strip()
+            if term not in ("SC 13D", "SC 13D/A"):
+                continue
+
+        updated_raw = entry.findtext(f"{_E}updated", "")
+        try:
+            filing_date = datetime.strptime(updated_raw[:10], "%Y-%m-%d").date()
+        except ValueError:
+            filing_date = datetime.utcnow().date()
+        if filing_date < cutoff:
+            continue
+
+        link_el  = entry.find(f"{_E}link")
+        index_url = link_el.get("href", "") if link_el is not None else ""
+        id_text  = entry.findtext(f"{_E}id", "")
+        title    = entry.findtext(f"{_E}title", "")
+        summary  = entry.findtext(f"{_E}summary", "")
+
+        m = _ACC_RE.search(id_text) or _ACC_RE.search(index_url)
+        if not m:
+            continue
+        acc_dashed = m.group(1)
+        if acc_dashed in seen:
+            continue
+
+        # Extract subject company CIK from index URL
+        cik_m = re.search(r'/Archives/edgar/data/(\d+)/', index_url)
+        subject_cik = cik_m.group(1).zfill(10) if cik_m else ""
+
+        # Only include if subject company is in our watchlist
+        ticker = cik_to_ticker.get(subject_cik, "")
+        if not ticker:
+            # Try to extract ticker from title like "ACME CORP (ACME) ..."
+            tk_m = _TICKER_RE.search(title)
+            if tk_m:
+                candidate = tk_m.group(1)
+                if candidate in ticker_to_cik:
+                    ticker = candidate
+            if not ticker:
+                continue
+
+        # Extract issuer name from title (format: "SC 13D - COMPANY NAME (TICKER)")
+        issuer_name = title.split(" - ")[-1].strip() if " - " in title else title
+
+        # Try to extract filer name from summary HTML
+        filer_name = ""
+        fn_m = re.search(r'Filed by[:\s]+([^<\n]+)', summary, re.I)
+        if fn_m:
+            filer_name = fn_m.group(1).strip()
+        if not filer_name:
+            # Fall back to title prefix before the dash
+            parts = title.split(" - ")
+            if len(parts) >= 2:
+                filer_name = parts[0].strip()
+
+        filing_url = index_url if index_url.startswith("http") else f"{WWW_BASE}{index_url}"
+
+        seen.add(acc_dashed)
+        records.append(Sc13dRecord(
+            id=acc_dashed,
+            issuerName=issuer_name,
+            ticker=ticker,
+            issuerCik=subject_cik,
+            filerName=filer_name,
+            percentOwned=None,
+            filingDate=str(filing_date),
+            filingUrl=filing_url,
+        ))
+
+    logger.info(f"SC 13D pipeline: {len(records)} filings for watchlist companies")
+    return records
+
+
+# ---------------------------------------------------------------------------
 # Main pipeline
 # ---------------------------------------------------------------------------
 
@@ -408,14 +561,20 @@ async def run_pipeline(cache: AppCache, client: EdgarClient):
         filings = _dedup_filings(filings)
         logger.info(f"After dedup: {len(filings)} filings")
 
-        # Market-cap enrichment + filter
+        # Market data enrichment (market cap + ADTV) + sector + filter
         tickers = [f.ticker for f in filings if f.ticker]
         await bulk_prefetch(tickers, settings.market_cap_ttl_seconds)
 
         filtered: list = []
         for f in filings:
-            cap     = await get_market_cap(f.ticker, settings.market_cap_ttl_seconds) if f.ticker else None
-            updated = f.model_copy(update={"marketCap": cap})
+            if f.ticker:
+                md = await get_market_data(f.ticker, settings.market_cap_ttl_seconds)
+                cap  = md.market_cap
+                adtv = md.adtv
+            else:
+                cap = adtv = None
+            sector = TICKER_SECTOR.get(f.ticker.upper()) if f.ticker else None
+            updated = f.model_copy(update={"marketCap": cap, "adtv": adtv, "sector": sector})
             if cap is None or cap <= settings.max_market_cap_usd:
                 filtered.append(updated)
         logger.info(f"After market-cap filter: {len(filtered)} filings")
@@ -423,7 +582,11 @@ async def run_pipeline(cache: AppCache, client: EdgarClient):
         with_signals = await apply_signals(filtered, client)
         logger.info(f"Pipeline complete: {len(with_signals)} filings with signals")
 
-        cache.update(with_signals)
+        # 13D filings
+        sc13d_cutoff = _last_n_business_days(180)
+        sc13d = await run_sc13d_pipeline(client, tech_ciks, sc13d_cutoff)
+
+        cache.update(with_signals, sc13d)
 
     except Exception as exc:
         logger.error(f"Pipeline error: {exc}", exc_info=True)

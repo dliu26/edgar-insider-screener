@@ -14,13 +14,14 @@ interface Props {
 }
 
 const COLUMNS = [
-  { key: "ticker", label: "Company", sortable: false },
-  { key: "insider", label: "Insider", sortable: false },
-  { key: "totalValue", label: "Value", sortable: true },
-  { key: "pricePerShare", label: "Price/Share", sortable: false },
-  { key: "marketCap", label: "Mkt Cap", sortable: true },
-  { key: "transactionDate", label: "Date", sortable: true },
-  { key: "signals", label: "Signals", sortable: false },
+  { key: "ticker",          label: "Company",  sortable: false },
+  { key: "insider",         label: "Insider",  sortable: false },
+  { key: "totalValue",      label: "Value",    sortable: true  },
+  { key: "pricePerShare",   label: "Price/Sh", sortable: false },
+  { key: "marketCap",       label: "Mkt Cap",  sortable: true  },
+  { key: "adtv",            label: "ADTV",     sortable: true  },
+  { key: "transactionDate", label: "Date",     sortable: true  },
+  { key: "signals",         label: "Signals",  sortable: false },
 ];
 
 export function FilingsTable({ filings, selectedId, onSelect, sort, onSort, isLoading }: Props) {
@@ -60,7 +61,7 @@ export function FilingsTable({ filings, selectedId, onSelect, sort, onSort, isLo
         <tbody className="divide-y divide-white/5 bg-surface-900">
           {filings.length === 0 ? (
             <tr>
-              <td colSpan={7} className="px-4 py-12 text-center text-gray-500">
+              <td colSpan={8} className="px-4 py-12 text-center text-gray-500">
                 No filings match your filters. Try adjusting the criteria above.
               </td>
             </tr>

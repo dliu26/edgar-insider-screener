@@ -2,12 +2,13 @@ from dataclasses import dataclass, field
 from datetime import datetime
 import asyncio
 from typing import Optional
-from .models.schemas import FilingRecord
+from .models.schemas import FilingRecord, Sc13dRecord
 
 
 @dataclass
 class AppCache:
     filings: list[FilingRecord] = field(default_factory=list)
+    sc13d_filings: list[Sc13dRecord] = field(default_factory=list)
     last_refreshed: Optional[datetime] = None
     is_refreshing: bool = False
     _lock: asyncio.Lock = field(default_factory=asyncio.Lock)
@@ -24,6 +25,8 @@ class AppCache:
         async with self._lock:
             self.is_refreshing = False
 
-    def update(self, filings: list[FilingRecord]):
+    def update(self, filings: list[FilingRecord], sc13d: Optional[list[Sc13dRecord]] = None):
         self.filings = filings
+        if sc13d is not None:
+            self.sc13d_filings = sc13d
         self.last_refreshed = datetime.utcnow()

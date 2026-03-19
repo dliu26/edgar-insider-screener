@@ -1,7 +1,7 @@
 import { clsx } from "clsx";
 import type { FilingRecord } from "@/types";
 import { SignalBadge } from "./SignalBadge";
-import { formatCurrency, formatShares, formatDate, formatMarketCap, shortenTitle } from "@/lib/formatters";
+import { formatCurrency, formatPrice, formatAdtv, formatShares, formatDate, formatMarketCap, shortenTitle } from "@/lib/formatters";
 
 interface Props {
   filing: FilingRecord;
@@ -37,10 +37,13 @@ export function FilingsTableRow({ filing, isSelected, onClick }: Props) {
         <div className="text-xs text-gray-500">{formatShares(filing.shares)} shares</div>
       </td>
       <td className="px-4 py-3 text-right text-sm text-gray-400">
-        {formatCurrency(filing.pricePerShare)}
+        {formatPrice(filing.pricePerShare)}
       </td>
       <td className="px-4 py-3 text-right text-sm text-gray-400">
         {formatMarketCap(filing.marketCap)}
+      </td>
+      <td className="px-4 py-3 text-right text-sm text-gray-400">
+        {formatAdtv(filing.adtv)}
       </td>
       <td className="px-4 py-3 text-sm text-gray-500">
         {formatDate(filing.transactionDate)}

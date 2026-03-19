@@ -109,11 +109,25 @@ def parse_form4_xml(xml_bytes: bytes, accession_number: str, filing_url: str) ->
     if title_el is not None and title_el.text:
         title = title_el.text.strip()
 
+    # Determine insider type and fill in missing title from relationship flags
+    insider_type = "corporate"
     relationship = reporting_owner.find(".//reportingOwnerRelationship")
-    if relationship is not None and not title:
-        is_director = relationship.find("isDirector")
-        if is_director is not None and is_director.text == "1":
-            title = "Director"
+    if relationship is not None:
+        def _flag(name: str) -> bool:
+            el = relationship.find(name)
+            return el is not None and el.text is not None and el.text.strip() == "1"
+
+        is_ten_pct = _flag("isTenPercentOwner")
+        is_director = _flag("isDirector")
+        is_officer  = _flag("isOfficer")
+
+        if is_ten_pct and not is_officer and not is_director:
+            insider_type = "institutional"
+        if not title:
+            if is_director:
+                title = "Director"
+            elif is_ten_pct:
+                title = "10% Owner"
 
     # ── find all non-derivative transactions and log codes ────────────────
     all_txns = root.findall(".//nonDerivativeTransaction")
@@ -173,6 +187,9 @@ def parse_form4_xml(xml_bytes: bytes, accession_number: str, filing_url: str) ->
             postTransactionShares=post_shares,
             is10b51=is_10b51,
             marketCap=None,
+            adtv=None,
+            sector=None,
+            insiderType=insider_type,
             signals=[],
             filingUrl=filing_url,
         ))

@@ -7,7 +7,7 @@ from .config import settings
 from .cache import AppCache
 from .services.edgar_client import EdgarClient
 from .services.pipeline import run_pipeline
-from .routers import filings, signals, refresh
+from .routers import filings, signals, refresh, sc13d
 
 logging.basicConfig(level=logging.INFO)
 logging.getLogger("app.services.filing_parser").setLevel(logging.DEBUG)
@@ -52,6 +52,7 @@ app.add_middleware(
 app.include_router(filings.router)
 app.include_router(signals.router)
 app.include_router(refresh.router)
+app.include_router(sc13d.router)
 
 
 @app.get("/health")
